@@ -6,44 +6,35 @@
 #import <sys/sysctl.h>
 #import <sys/stat.h>
 #include <string.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <errno.h>
 #include "fishhook.h"
 
 // ==========================================
-// 核心：内存完整性欺骗 (Memory Spoofing) - 延迟初始化终极版
+// 内存读取防护：定点致盲 (放弃全量备份)
 // ==========================================
-static uint64_t g_real_text_addr = 0; 
-static uint64_t g_text_size = 0;
-static void* g_clean_text_backup = NULL;
+static uint64_t g_bypass_base = 0;
+static uint64_t g_bypass_size = 0;
 
-static _Atomic bool g_backup_ready = false; 
-
-// 延迟初始化函数，确保只执行一次
-static void EnsureBackupInitialized() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
-        if (!header) return;
-        
-        unsigned long text_size = 0;
-        uint8_t *text_ptr_unslid = getsectiondata(header, "__TEXT", "__text", &text_size);
-        
-        if (text_ptr_unslid && text_size > 0) {
-            g_real_text_addr = (uint64_t)text_ptr_unslid + slide;
-            g_text_size = text_size;
-            
-            void* temp_backup = malloc(text_size);
-            if (temp_backup) {
-                memcpy(temp_backup, (void*)g_real_text_addr, text_size);
-                g_clean_text_backup = temp_backup;
-                atomic_store(&g_backup_ready, true);
-                NSLog(@"[AAC] Clean .text backed up (Lazy)! Real Addr: 0x%llx", g_real_text_addr);
+// 获取我们自己外挂模块的地址范围
+static void InitBypassRange() {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && (strstr(name, "FullBypass") || strstr(name, "Substrate") || strstr(name, "frida"))) {
+            const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (header) {
+                unsigned long text_size = 0;
+                uint8_t *text_ptr = getsectiondata(header, "__TEXT", "__text", &text_size);
+                if (text_ptr && text_size > 0) {
+                    g_bypass_base = (uint64_t)text_ptr + slide;
+                    g_bypass_size = text_size;
+                    NSLog(@"[AAC] Found bypass module: 0x%llx, Size: %llu", g_bypass_base, g_bypass_size);
+                }
             }
+            break;
         }
-    });
+    }
 }
 
 // Hook: mach_vm_read
@@ -53,26 +44,20 @@ kern_return_t my_mach_vm_read(vm_map_t target_task, mach_vm_address_t address, m
         return orig_mach_vm_read(target_task, address, size, data, dataCnt);
     }
     
-    // 首次触发扫描时，才去进行代码段备份
-    EnsureBackupInitialized();
-    
-    kern_return_t kr = orig_mach_vm_read(target_task, address, size, data, dataCnt);
-    if (kr != KERN_SUCCESS) return kr;
-    
-    if (atomic_load(&g_backup_ready) && size > 0 && address <= ULLONG_MAX - size &&
-        address + size > g_real_text_addr && 
-        address < g_real_text_addr + g_text_size) {
-        
-        uint64_t overlap_start = (address > g_real_text_addr) ? address : g_real_text_addr;
-        uint64_t overlap_end = ((address + size) < (g_real_text_addr + g_text_size)) ? (address + size) : (g_real_text_addr + g_text_size);
-        uint64_t overlap_size = overlap_end - overlap_start;
-        
-        uint64_t backup_offset = overlap_start - g_real_text_addr;
-        uint64_t buffer_offset = overlap_start - address;
-        
-        memcpy((void*)(*data + buffer_offset), (uint8_t*)g_clean_text_backup + backup_offset, overlap_size);
+    // 如果反作弊试图读取我们外挂所在的内存区域，直接返回一堆 0 (致盲)
+    if (g_bypass_base != 0 && address >= g_bypass_base && address < (g_bypass_base + g_bypass_size)) {
+        vm_offset_t new_mem;
+        kern_return_t kr = vm_allocate(mach_task_self(), &new_mem, size, VM_FLAGS_ANYWHERE);
+        if (kr == KERN_SUCCESS) {
+            memset((void*)new_mem, 0, size); // 填 0 致盲
+            *data = new_mem;
+            *dataCnt = size;
+            return KERN_SUCCESS;
+        }
     }
-    return KERN_SUCCESS;
+    
+    // 否则，正常放行。不再去干扰系统内核读取那 227MB 的游戏代码
+    return orig_mach_vm_read(target_task, address, size, data, dataCnt);
 }
 
 // Hook: mach_vm_read_overwrite
@@ -82,29 +67,18 @@ kern_return_t my_mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t 
         return orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
     }
     
-    EnsureBackupInitialized();
-    
-    kern_return_t kr = orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
-    if (kr != KERN_SUCCESS) return kr;
-    
-    if (atomic_load(&g_backup_ready) && size > 0 && address <= ULLONG_MAX - size &&
-        address + size > g_real_text_addr && 
-        address < g_real_text_addr + g_text_size) {
-        
-        uint64_t overlap_start = (address > g_real_text_addr) ? address : g_real_text_addr;
-        uint64_t overlap_end = ((address + size) < (g_real_text_addr + g_text_size)) ? (address + size) : (g_real_text_addr + g_text_size);
-        uint64_t overlap_size = overlap_end - overlap_start;
-        
-        uint64_t backup_offset = overlap_start - g_real_text_addr;
-        uint64_t buffer_offset = overlap_start - address;
-        
-        memcpy((void*)(data + buffer_offset), (uint8_t*)g_clean_text_backup + backup_offset, overlap_size);
+    // 如果读取的是我们的外挂区域，填 0 致盲
+    if (g_bypass_base != 0 && address >= g_bypass_base && address < (g_bypass_base + g_bypass_size)) {
+        memset((void*)data, 0, size);
+        *outsize = size;
+        return KERN_SUCCESS;
     }
-    return KERN_SUCCESS;
+    
+    return orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
 }
 
 // ==========================================
-// 之前的常规防护
+// 常规防护：拦截文件与模块扫描 (防封核心)
 // ==========================================
 
 // Hook: _dyld_get_image_name
@@ -141,10 +115,7 @@ int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 static int (*orig_stat)(const char *path, void *buf);
 int my_stat(const char *path, void *buf) {
     int ret = orig_stat(path, buf);
-    
-    if (ret == -1 && errno == EFAULT) {
-        return ret;
-    }
+    if (ret == -1 && errno == EFAULT) return ret;
     
     if (path != NULL) {
         if (strstr(path, "/Applications/Cydia.app") || 
@@ -162,8 +133,8 @@ int my_stat(const char *path, void *buf) {
 // ==========================================
 __attribute__((constructor))
 static void bypass_init() {
-    // 延迟初始化：将极其耗时的备份逻辑从高危的 constructor 中移除
-    // 改为在第一次需要伪装内存时自动按需加载 (EnsureBackupInitialized)
+    // 初始化时仅获取我们外挂自身的地址，只有几十 KB，瞬间完成，极其安全
+    InitBypassRange();
     
     struct rebinding rebindings[] = {
         {"_dyld_get_image_name", (void *)my_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
@@ -174,6 +145,5 @@ static void bypass_init() {
     };
     
     rebind_symbols(rebindings, 5);
-    
     NSLog(@"[AAC] Advanced Hooks applied successfully. ACE should be blind now.");
 }
