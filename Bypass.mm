@@ -69,28 +69,28 @@ const char* my_dyld_get_image_name(uint32_t image_index) {
     return real_name;
 }
 
-// 挂钩：sysctl
+// Hook: sysctl
 static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-NULL && 名称长度 >= 3 && 名称[0] == CTL_KERN && 名称[1] == KERN_PROC && 名称[
-        如果 (oldp != NULL) {
+    if (ret == 0 && name != NULL && namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+        if (oldp != NULL) {
             struct kinfo_proc *info = (struct kinfo_proc *)oldp;
-            如果 (info->kp_proc.p_flag & P_TRACED) {
+            if (info->kp_proc.p_flag & P_TRACED) {
                 info->kp_proc.p_flag &= ~P_TRACED;
             }
         }
     }
-    返回 ret;
+    return ret;
 }
 
-// 钩子：stat
-静态 int (*orig_stat)(const char *path, void *buf);
-整型 my_stat(常量 字符指针 *path,  void *buf) {
+// Hook: stat
+static int (*orig_stat)(const char *path, void *buf);
+int my_stat(const char *path, void *buf) {
     if (!path) return orig_stat(path, buf);
     NSString *pathStr = [NSString stringWithUTF8String:path];
-    如果 ([pathStr 包含字符串:@"/Applications/Cydia.app"] || [pathStr 包含字符串:@"/Library/MobileSubstrate"]) {
-        返回 -1; 
+    if ([pathStr containsString:@"/Applications/Cydia.app"] || [pathStr containsString:@"/Library/MobileSubstrate"]) {
+        return -1; 
     }
     return orig_stat(path, buf);
 }
@@ -101,7 +101,7 @@ NULL && 名称长度 >= 3 && 名称[0] == CTL_KERN && 名称[1] == KERN_PROC && 
 __attribute__((constructor))
 static void bypass_init() {
     // 1. 备份纯净代码
-    备份清理文本段();
+    BackupCleanTextSegment();
     
     // 2. 挂载所有拦截网
     struct rebinding rebindings[] = {
@@ -112,7 +112,7 @@ static void bypass_init() {
         {"mach_vm_read_overwrite", (void *)my_mach_vm_read_overwrite, (void **)&orig_mach_vm_read_overwrite}
     };
     
-    重新绑定符号（rebindings，5);
+    rebind_symbols(rebindings, 5);
     
-    NSLog(@"[AAC] 高级钩子已成功应用。ACE 现在应该已经失效了。");
+    NSLog(@"[AAC] Advanced Hooks applied successfully. ACE should be blind now.");
 }
