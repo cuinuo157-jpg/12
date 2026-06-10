@@ -12,38 +12,38 @@
 #include "fishhook.h"
 
 // ==========================================
-// 核心：内存完整性欺骗 (Memory Spoofing) - 多线程安全终极版
+// 核心：内存完整性欺骗 (Memory Spoofing) - 延迟初始化终极版
 // ==========================================
 static uint64_t g_real_text_addr = 0; 
 static uint64_t g_text_size = 0;
 static void* g_clean_text_backup = NULL;
 
-// 使用原子标志位，确保备份完全就绪后才允许读取
 static _Atomic bool g_backup_ready = false; 
 
-// 初始化备份：确保准确拿到 ASLR 后的绝对地址
-void BackupCleanTextSegment() {
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!header) return;
-    
-    unsigned long text_size = 0;
-    uint8_t *text_ptr_unslid = getsectiondata(header, "__TEXT", "__text", &text_size);
-    
-    if (text_ptr_unslid && text_size > 0) {
-        g_real_text_addr = (uint64_t)text_ptr_unslid + slide;
-        g_text_size = text_size;
+// 延迟初始化函数，确保只执行一次
+static void EnsureBackupInitialized() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+        if (!header) return;
         
-        void* temp_backup = malloc(text_size);
-        if (temp_backup) {
-            memcpy(temp_backup, (void*)g_real_text_addr, text_size);
-            g_clean_text_backup = temp_backup;
+        unsigned long text_size = 0;
+        uint8_t *text_ptr_unslid = getsectiondata(header, "__TEXT", "__text", &text_size);
+        
+        if (text_ptr_unslid && text_size > 0) {
+            g_real_text_addr = (uint64_t)text_ptr_unslid + slide;
+            g_text_size = text_size;
             
-            // 只有当数据彻底拷贝完成，才把标志位置为 true
-            atomic_store(&g_backup_ready, true);
-            NSLog(@"[AAC] Clean .text backed up! Real Addr: 0x%llx, Size: %lu", g_real_text_addr, text_size);
+            void* temp_backup = malloc(text_size);
+            if (temp_backup) {
+                memcpy(temp_backup, (void*)g_real_text_addr, text_size);
+                g_clean_text_backup = temp_backup;
+                atomic_store(&g_backup_ready, true);
+                NSLog(@"[AAC] Clean .text backed up (Lazy)! Real Addr: 0x%llx", g_real_text_addr);
+            }
         }
-    }
+    });
 }
 
 // Hook: mach_vm_read
@@ -53,10 +53,12 @@ kern_return_t my_mach_vm_read(vm_map_t target_task, mach_vm_address_t address, m
         return orig_mach_vm_read(target_task, address, size, data, dataCnt);
     }
     
+    // 首次触发扫描时，才去进行代码段备份
+    EnsureBackupInitialized();
+    
     kern_return_t kr = orig_mach_vm_read(target_task, address, size, data, dataCnt);
     if (kr != KERN_SUCCESS) return kr;
     
-    // 使用原子标志判断，防止竞态条件读到未完成初始化的指针
     if (atomic_load(&g_backup_ready) && size > 0 && address <= ULLONG_MAX - size &&
         address + size > g_real_text_addr && 
         address < g_real_text_addr + g_text_size) {
@@ -70,7 +72,6 @@ kern_return_t my_mach_vm_read(vm_map_t target_task, mach_vm_address_t address, m
         
         memcpy((void*)(*data + buffer_offset), (uint8_t*)g_clean_text_backup + backup_offset, overlap_size);
     }
-    
     return KERN_SUCCESS;
 }
 
@@ -80,6 +81,8 @@ kern_return_t my_mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t 
     if (data == 0 || outsize == NULL) {
         return orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
     }
+    
+    EnsureBackupInitialized();
     
     kern_return_t kr = orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
     if (kr != KERN_SUCCESS) return kr;
@@ -159,7 +162,8 @@ int my_stat(const char *path, void *buf) {
 // ==========================================
 __attribute__((constructor))
 static void bypass_init() {
-    BackupCleanTextSegment();
+    // 延迟初始化：将极其耗时的备份逻辑从高危的 constructor 中移除
+    // 改为在第一次需要伪装内存时自动按需加载 (EnsureBackupInitialized)
     
     struct rebinding rebindings[] = {
         {"_dyld_get_image_name", (void *)my_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
