@@ -14,7 +14,7 @@ jobs:
       - name: Compile Dylib
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -dynamiclib -arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=12.0 -fobjc-arc -framework Foundation -framework UIKit Bypass.mm fishhook.c -o FullBypass.dylib
+          clang -dynamiclib -arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=12.0 -fobjc-arc -framework Foundation -framework UIKit -lc++ Bypass.mm fishhook.c -o FullBypass.dylib
           brew install ldid
           ldid -S FullBypass.dylib
 
