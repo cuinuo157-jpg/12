@@ -4,6 +4,7 @@
 #import <dlfcn.h>
 #import <sys/sysctl.h>
 #import <sys/stat.h>
+#include <string.h>
 #include "fishhook.h"
 
 // ==========================================
@@ -53,7 +54,7 @@ void BackupCleanTextSegment() {
 }
 
 // ==========================================
-// 之前的常规防护
+// 常规防护 (修改为纯C语言，防崩溃)
 // ==========================================
 
 // Hook: _dyld_get_image_name
@@ -62,8 +63,11 @@ const char* my_dyld_get_image_name(uint32_t image_index) {
     const char* real_name = orig_dyld_get_image_name(image_index);
     if (!real_name) return real_name;
     
-    NSString *nameStr = [NSString stringWithUTF8String:real_name];
-    if ([nameStr containsString:@"Substrate"] || [nameStr containsString:@"frida"] || [nameStr containsString:@"Cheat"] || [nameStr containsString:@"FullBypass.dylib"]) {
+    // 使用纯C的strstr查找，绝对安全，不会崩溃
+    if (strstr(real_name, "Substrate") || 
+        strstr(real_name, "frida") || 
+        strstr(real_name, "Cheat") || 
+        strstr(real_name, "FullBypass.dylib")) {
         return "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
     }
     return real_name;
@@ -88,8 +92,10 @@ int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 static int (*orig_stat)(const char *path, void *buf);
 int my_stat(const char *path, void *buf) {
     if (!path) return orig_stat(path, buf);
-    NSString *pathStr = [NSString stringWithUTF8String:path];
-    if ([pathStr containsString:@"/Applications/Cydia.app"] || [pathStr containsString:@"/Library/MobileSubstrate"]) {
+    
+    // 使用纯C查找防闪退
+    if (strstr(path, "/Applications/Cydia.app") || 
+        strstr(path, "/Library/MobileSubstrate")) {
         return -1; 
     }
     return orig_stat(path, buf);
