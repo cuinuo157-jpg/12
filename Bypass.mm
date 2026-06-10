@@ -4,10 +4,11 @@
 #import <dlfcn.h>
 #import <sys/sysctl.h>
 #import <sys/stat.h>
-#import <sys/mman.h>
-#import <fcntl.h>
 #include "fishhook.h"
 
+// ==========================================
+// 核心：内存完整性欺骗 (Memory Spoofing)
+// ==========================================
 static uint64_t game_base_addr = 0;
 static uint64_t game_text_size = 0;
 static void* clean_text_backup = NULL;
@@ -19,7 +20,7 @@ kern_return_t my_mach_vm_read(vm_map_t target_task, mach_vm_address_t address, m
         uint64_t offset = address - game_base_addr;
         *data = (vm_offset_t)((uint8_t*)clean_text_backup + offset);
         *dataCnt = size;
-        return KERN_SUCCESS; 
+        return KERN_SUCCESS; // 给腾讯返回那份干净的备份内存！
     }
     return orig_mach_vm_read(target_task, address, size, data, dataCnt);
 }
@@ -36,99 +37,82 @@ kern_return_t my_mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t 
     return orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
 }
 
-// [核心升级] 0内存占用、瞬间加载的内存欺骗！
+// 在游戏刚启动时，把纯净代码段藏起来
 void BackupCleanTextSegment() {
     game_base_addr = _dyld_get_image_vmaddr_slide(0) + 0x100000000;
     const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    
     unsigned long text_size = 0;
     uint8_t *text_ptr = getsectiondata(header, "__TEXT", "__text", &text_size);
     
     if (text_ptr && text_size > 0) {
         game_text_size = text_size;
-        const char *image_path = _dyld_get_image_name(0);
-        int fd = open(image_path, O_RDONLY);
-        if (fd >= 0) {
-            struct stat st;
-            fstat(fd, &st);
-            // 将巨大的 __text 段直接映射到虚拟内存（借用硬盘），不吃物理运行内存(RAM)
-            void *file_map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (file_map != MAP_FAILED) {
-                const struct load_command *cmd = (const struct load_command *)((uint8_t *)header + sizeof(struct mach_header_64));
-                for (uint32_t cmd_idx = 0; cmd_idx < header->ncmds; cmd_idx++) {
-                    if (cmd->cmd == LC_SEGMENT_64) {
-                        struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-                        if (strcmp(seg->segname, "__TEXT") == 0) {
-                            struct section_64 *sec = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
-                            for (uint32_t sect_idx = 0; sect_idx < seg->nsects; sect_idx++) {
-                                if (strcmp(sec[sect_idx].sectname, "__text") == 0) {
-                                    clean_text_backup = (uint8_t *)file_map + sec[sect_idx].offset;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    cmd = (const struct load_command *)((uint8_t *)cmd + cmd->cmdsize);
-                }
-            }
-        }
+        clean_text_backup = malloc(text_size);
+        memcpy(clean_text_backup, text_ptr, text_size);
+        NSLog(@"[AAC] Clean .text segment backed up! (Size: %lu)", text_size);
     }
 }
 
+// ==========================================
+// 之前的常规防护
+// ==========================================
+
+// Hook: _dyld_get_image_name
 static const char* (*orig_dyld_get_image_name)(uint32_t image_index);
 const char* my_dyld_get_image_name(uint32_t image_index) {
     const char* real_name = orig_dyld_get_image_name(image_index);
     if (!real_name) return real_name;
+    
     NSString *nameStr = [NSString stringWithUTF8String:real_name];
-    if ([nameStr containsString:@"Substrate"] || [nameStr containsString:@"frida"] || [nameStr containsString:@"Cheat"] || [nameStr containsString:@".dylib"]) {
+    if ([nameStr containsString:@"Substrate"] || [nameStr containsString:@"frida"] || [nameStr containsString:@"Cheat"] || [nameStr containsString:@"FullBypass.dylib"]) {
         return "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
     }
-    返回真实名称；
+    return real_name;
 }
 
+// 挂钩：sysctl
 static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 NULL && 名称长度 >= 3 && 名称[0] == CTL_KERN && 名称[1] == KERN_PROC && 名称[
         如果 (oldp != NULL) {
-            结构体 kinfo_proc *info = (结构体 kinfo_proc *)oldp;
-            if (info->kp_proc.p_flag & P_TRACED) info->kp_proc.p_flag &= ~P_TRACED;
+            struct kinfo_proc *info = (struct kinfo_proc *)oldp;
+            如果 (info->kp_proc.p_flag & P_TRACED) {
+                info->kp_proc.p_flag &= ~P_TRACED;
+            }
         }
     }
     返回 ret;
 }
 
-静态 int (*orig_stat)( char *path, void *buf);
+// 钩子：stat
+静态 int (*orig_stat)(const char *path, void *buf);
 整型 my_stat(常量 字符指针 *path,  void *buf) {
-     (!path) return orig_stat(path, buf);
+    if (!path) return orig_stat(path, buf);
     NSString *pathStr = [NSString stringWithUTF8String:path];
-“/Applications/Cydia.app”“/Library/MobileSubstrate”]) 返回 -
+    如果 ([pathStr 包含字符串:@"/Applications/Cydia.app"] || [pathStr 包含字符串:@"/Library/MobileSubstrate"]) {
+        返回 -1; 
+    }
     return orig_stat(path, buf);
 }
 
-// 拦截直接强杀指令，防止 Tersafe 引发闪退
-static void (*orig_abort)(void);
-void my_abort() {
-    while(1) { sleep(100); }
-}
-
-static void (*orig_exit)(int);
-void my_exit(int status) {
-    while(1) { sleep(100); }
-}
-
-
+// ==========================================
+// 初始化
+// ==========================================
 __attribute__((constructor))
-静态 void bypass_init() {
+static void bypass_init() {
+    // 1. 备份纯净代码
     备份清理文本段();
+    
+    // 2. 挂载所有拦截网
     struct rebinding rebindings[] = {
         {"_dyld_get_image_name", (void *)my_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
         {"sysctl", (void *)my_sysctl, (void **)&orig_sysctl},
         {"stat", (void *)my_stat, (void **)&orig_stat},
         {"mach_vm_read", (void *)my_mach_vm_read, (void **)&orig_mach_vm_read},
-        {"mach_vm_read_overwrite", (void *)my_mach_vm_read_overwrite, (void **)&orig_mach_vm_read_overwrite},
-        {"abort", (void *)my_abort, (void **)&orig_abort},
-        {"exit", (void *)my_exit, (void **)&orig_exit}
+        {"mach_vm_read_overwrite", (void *)my_mach_vm_read_overwrite, (void **)&orig_mach_vm_read_overwrite}
     };
-    rebind_symbols(rebindings, 7);
+    
+    重新绑定符号（rebindings，5);
+    
+    NSLog(@"[AAC] 高级钩子已成功应用。ACE 现在应该已经失效了。");
 }
