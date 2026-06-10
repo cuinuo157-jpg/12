@@ -2,7 +2,6 @@
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <sys/sysctl.h>
-#import <sys/stat.h>
 #include "fishhook.h"
 
 // 1. Hook _dyld_get_image_name
@@ -27,10 +26,9 @@ static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     
-    // 只处理成功获取进程信息的调用
+    // 抹除调试标志位
     if (ret == 0 && name != NULL && namelen >= 3) {
         if (name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
-            // 在较新的 SDK 中直接操作 kinfo_proc 可能会有问题，这里做指针位移处理
             if (oldp != NULL) {
                 struct kinfo_proc *info = (struct kinfo_proc *)oldp;
                 if (info->kp_proc.p_flag & P_TRACED) {
@@ -43,8 +41,8 @@ int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 }
 
 // 3. Hook stat
-static int (*orig_stat)(const char *restrict path, struct stat *restrict buf);
-int my_stat(const char *restrict path, struct stat *restrict buf) {
+static int (*orig_stat)(const char *path, void *buf);
+int my_stat(const char *path, void *buf) {
     if (!path) return orig_stat(path, buf);
     
     NSString *pathStr = [NSString stringWithUTF8String:path];
